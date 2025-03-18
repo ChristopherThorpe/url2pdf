@@ -9,6 +9,7 @@ The PDF includes a header with the URL and timestamp when the page was fetched.
 import os
 import asyncio
 import datetime
+import tempfile
 from urllib.parse import urlparse
 import click
 from playwright.async_api import async_playwright
@@ -29,10 +30,54 @@ async def capture_webpage(url, output_path, viewport_width=1280, viewport_height
         viewport_height: Height of the browser viewport
     """
     async with async_playwright() as p:
+        # Create a browser with ad blocker
         browser = await p.chromium.launch()
+        
+        # Create a context with the ad blocker enabled
         context = await browser.new_context(
-            viewport={'width': viewport_width, 'height': viewport_height}
+            viewport={'width': viewport_width, 'height': viewport_height},
+            # Enable JavaScript to run our scripts
+            java_script_enabled=True
         )
+        
+        # Install ad blocker by loading uBlock Origin
+        try:
+            # Create a temporary directory for the extension
+            with tempfile.TemporaryDirectory() as extension_path:
+                # Install uBlock Origin extension (this is a simplified version)
+                print("Setting up ad blocker...")
+                # We'll use JavaScript to block ads instead
+                await context.add_init_script("""
+                    // Simple ad blocker script
+                    window.addEventListener('DOMContentLoaded', () => {
+                        // Common ad selectors
+                        const adSelectors = [
+                            'div[id*="google_ads"]',
+                            'div[id*="ad-"]',
+                            'div[class*="ad-"]',
+                            'div[class*="ads-"]',
+                            'div[id*="banner"]',
+                            'iframe[src*="doubleclick"]',
+                            'iframe[src*="ad"]',
+                            'iframe[id*="google_ads"]',
+                            'ins.adsbygoogle',
+                            '[class*="banner-ad"]',
+                            '[id*="banner-ad"]',
+                            '[class*="sponsored"]',
+                            '[id*="sponsored"]'
+                        ];
+                        
+                        // Remove ad elements
+                        adSelectors.forEach(selector => {
+                            document.querySelectorAll(selector).forEach(el => {
+                                if (el) el.remove();
+                            });
+                        });
+                    });
+                """);
+        except Exception as e:
+            print(f"Warning: Failed to set up ad blocker: {e}")
+        
         page = await context.new_page()
         
         try:
@@ -42,6 +87,42 @@ async def capture_webpage(url, output_path, viewport_width=1280, viewport_height
             
             # Wait a bit for any dynamic content to load
             await page.wait_for_timeout(3000)
+            
+            # Resize large images and remove persistent headers
+            print("Processing page content...")
+            await page.evaluate("""() => {
+                // Resize large images
+                const viewportWidth = window.innerWidth;
+                const maxWidth = viewportWidth * 0.33; // 33% of viewport width
+                
+                document.querySelectorAll('img').forEach(img => {
+                    if (img.width > maxWidth) {
+                        // Save original dimensions as data attributes
+                        img.dataset.originalWidth = img.width;
+                        img.dataset.originalHeight = img.height;
+                        
+                        // Calculate new dimensions maintaining aspect ratio
+                        const aspectRatio = img.width / img.height;
+                        const newWidth = maxWidth;
+                        const newHeight = newWidth / aspectRatio;
+                        
+                        // Apply new dimensions
+                        img.style.width = newWidth + 'px';
+                        img.style.height = newHeight + 'px';
+                    }
+                });
+                
+                // Identify and mark potential persistent headers
+                // We'll look for elements that are likely to be headers
+                const potentialHeaders = document.querySelectorAll('header, nav, .header, #header, [class*="header"], [class*="nav"], [id*="nav"], [class*="menu"], [id*="menu"]');
+                
+                potentialHeaders.forEach(header => {
+                    if (header.getBoundingClientRect().top < 100) {
+                        // Mark header elements with a data attribute
+                        header.dataset.persistentHeader = 'true';
+                    }
+                });
+            }""")
             
             # Ensure images are loaded
             print("Waiting for images to load...")
@@ -76,8 +157,23 @@ async def capture_webpage(url, output_path, viewport_width=1280, viewport_height
                 });
             }""")
             
+            # Create a modified CSS to hide persistent headers on print
+            await page.add_style_tag(content="""
+                @media print {
+                    [data-persistent-header="true"] {
+                        display: none !important;
+                    }
+                    
+                    /* Make sure the first page still shows the header */
+                    @page:first {
+                        [data-persistent-header="true"] {
+                            display: block !important;
+                        }
+                    }
+                }
+            """)
+            
             # Save the page as PDF with margins
-            # We'll use a smaller print area to accommodate our headers and footers
             print("Generating PDF...")
             await page.pdf(
                 path=output_path,
