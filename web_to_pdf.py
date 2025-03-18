@@ -19,7 +19,7 @@ from reportlab.lib.units import inch
 from PyPDF2 import PdfWriter, PdfReader
 
 
-async def capture_webpage(url, output_path, viewport_width=1280, viewport_height=800):
+async def capture_webpage(url, output_path, viewport_width=1280, viewport_height=800, scale=100):
     """
     Capture a webpage and save it as PDF using Playwright.
     
@@ -28,155 +28,266 @@ async def capture_webpage(url, output_path, viewport_width=1280, viewport_height
         output_path: Path where the PDF will be saved
         viewport_width: Width of the browser viewport
         viewport_height: Height of the browser viewport
+        scale: Percentage scale for the content (100 = full size)
     """
+    # Apply scaling to viewport dimensions
+    scaled_viewport_width = int(viewport_width * scale / 100)
+    scaled_viewport_height = int(viewport_height * scale / 100)
+    
+    # Create first page PDF and rest pages PDF
+    first_page_pdf = f"first_page_{os.path.basename(output_path)}"
+    rest_pages_pdf = f"rest_pages_{os.path.basename(output_path)}"
+    
     async with async_playwright() as p:
         # Create a browser with ad blocker
         browser = await p.chromium.launch()
         
-        # Create a context with the ad blocker enabled
+        # Set up a modern Chrome user agent
+        desktop_user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+        headers = {
+            'User-Agent': desktop_user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        # Create a single context with the user agent
         context = await browser.new_context(
-            viewport={'width': viewport_width, 'height': viewport_height},
-            # Enable JavaScript to run our scripts
-            java_script_enabled=True
+            viewport={'width': scaled_viewport_width, 'height': scaled_viewport_height},
+            java_script_enabled=True,
+            user_agent=desktop_user_agent,
+            extra_http_headers=headers
         )
         
-        # Install ad blocker by loading uBlock Origin
+        # Create a page to fetch the content
+        fetch_page = await context.new_page()
+        
+        # Navigate to the URL and cache the content
+        print(f"Fetching content from {url}...")
+        await fetch_page.goto(url, wait_until='networkidle', timeout=60000)
+        
+        # Get the cached HTML content
+        cached_content = await fetch_page.content()
+        
+        # Create two pages from the cached content
+        first_page = await context.new_page()
+        rest_pages = await context.new_page()
+        
+        # Set the cached content on both pages
+        await first_page.set_content(cached_content)
+        await rest_pages.set_content(cached_content)
+        
+        # Close the fetch page as we no longer need it
+        await fetch_page.close()
+        
         try:
-            # Create a temporary directory for the extension
-            with tempfile.TemporaryDirectory() as extension_path:
-                # Install uBlock Origin extension (this is a simplified version)
-                print("Setting up ad blocker...")
-                # We'll use JavaScript to block ads instead
-                await context.add_init_script("""
-                    // Simple ad blocker script
-                    window.addEventListener('DOMContentLoaded', () => {
-                        // Common ad selectors
-                        const adSelectors = [
-                            'div[id*="google_ads"]',
-                            'div[id*="ad-"]',
-                            'div[class*="ad-"]',
-                            'div[class*="ads-"]',
-                            'div[id*="banner"]',
-                            'iframe[src*="doubleclick"]',
-                            'iframe[src*="ad"]',
-                            'iframe[id*="google_ads"]',
-                            'ins.adsbygoogle',
-                            '[class*="banner-ad"]',
-                            '[id*="banner-ad"]',
-                            '[class*="sponsored"]',
-                            '[id*="sponsored"]'
-                        ];
-                        
-                        // Remove ad elements
-                        adSelectors.forEach(selector => {
-                            document.querySelectorAll(selector).forEach(el => {
-                                if (el) el.remove();
+            # Install ad blocker by loading uBlock Origin
+            try:
+                # Create a temporary directory for the extension
+                with tempfile.TemporaryDirectory() as extension_path:
+                    # Install uBlock Origin extension (this is a simplified version)
+                    print("Setting up ad blocker...")
+                    # We'll use JavaScript to block ads instead
+                    ad_block_script = """
+                        // Simple ad blocker script
+                        window.addEventListener('DOMContentLoaded', () => {
+                            // Common ad selectors
+                            const adSelectors = [
+                                'div[id*="google_ads"]',
+                                'div[id*="ad-"]',
+                                'div[class*="ad-"]',
+                                'div[class*="ads-"]',
+                                'div[id*="banner"]',
+                                'iframe[src*="doubleclick"]',
+                                'iframe[src*="ad"]',
+                                'iframe[id*="google_ads"]',
+                                'ins.adsbygoogle',
+                                '[class*="banner-ad"]',
+                                '[id*="banner-ad"]',
+                                '[class*="sponsored"]',
+                                '[id*="sponsored"]'
+                            ];
+                            
+                            // Remove ad elements
+                            adSelectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    if (el) el.remove();
+                                });
                             });
                         });
+                    """
+                    
+                    await first_page.add_init_script(ad_block_script)
+                    await rest_pages.add_init_script(ad_block_script)
+            except Exception as e:
+                print(f"Warning: Failed to set up ad blocker: {e}")
+            
+            # Enhanced cookie popup removal with compatible selectors
+            remove_popups_js = """() => {
+                // Common cookie popup selectors
+                const cookieSelectors = [
+                    // Common classes and IDs
+                    '.cookie-banner', '#cookie-banner',
+                    '.cookie-notice', '#cookie-notice',
+                    '.cookie-consent', '#cookie-consent',
+                    '.cookie-policy', '#cookie-policy',
+                    '.cookie-modal', '#cookie-modal',
+                    '.gdpr', '#gdpr',
+                    '.privacy-alert', '#privacy-alert',
+                    
+                    // Position-based detection for bottom elements
+                    'div[style*="bottom: 0"]',
+                    'div[style*="position: fixed"][style*="bottom"]',
+                    'div[style*="z-index"][style*="position: fixed"]',
+                    
+                    // Generic elements that might be popups
+                    '.modal', '#modal',
+                    '.popup', '#popup',
+                    '.overlay', '#overlay'
+                ];
+                
+                // Remove elements matching selectors
+                cookieSelectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        // Check if position is fixed or absolute
+                        const style = window.getComputedStyle(el);
+                        if (style.position === 'fixed' || style.position === 'absolute') {
+                            // Check text content
+                            const text = el.textContent.toLowerCase();
+                            if (text.includes('cookie') || 
+                                text.includes('consent') || 
+                                text.includes('privacy') ||
+                                text.includes('gdpr') ||
+                                el.classList.contains('cookie') ||
+                                el.id.includes('cookie')) {
+                                el.remove();
+                            }
+                        }
                     });
-                """);
-        except Exception as e:
-            print(f"Warning: Failed to set up ad blocker: {e}")
-        
-        page = await context.new_page()
-        
-        try:
-            # Navigate to the URL
-            print(f"Navigating to {url}...")
-            await page.goto(url, wait_until='networkidle', timeout=60000)
+                });
+            }"""
+            
+            # Remove popups from both contexts
+            await first_page.evaluate(remove_popups_js)
+            await rest_pages.evaluate(remove_popups_js)
             
             # Wait a bit for any dynamic content to load
-            await page.wait_for_timeout(3000)
+            await first_page.wait_for_timeout(3000)
+            await rest_pages.wait_for_timeout(3000)
             
-            # Resize large images and remove persistent headers
-            print("Processing page content...")
-            await page.evaluate("""() => {
+            # Ensure images are loaded on both pages
+            print("Waiting for images to load...")
+            await first_page.wait_for_load_state('networkidle')
+            await rest_pages.wait_for_load_state('networkidle')
+            
+            # Process images and identify headers on the first page
+            await first_page.evaluate("""() => {
                 // Resize large images
                 const viewportWidth = window.innerWidth;
                 const maxWidth = viewportWidth * 0.33; // 33% of viewport width
                 
                 document.querySelectorAll('img').forEach(img => {
-                    if (img.width > maxWidth) {
-                        // Save original dimensions as data attributes
-                        img.dataset.originalWidth = img.width;
-                        img.dataset.originalHeight = img.height;
+                    const computedStyle = window.getComputedStyle(img);
+                    let width = img.width || parseInt(computedStyle.width);
+                    
+                    if (width > maxWidth) {
+                        // Save original dimensions
+                        img.dataset.originalWidth = width;
+                        img.dataset.originalHeight = img.height || parseInt(computedStyle.height);
                         
                         // Calculate new dimensions maintaining aspect ratio
-                        const aspectRatio = img.width / img.height;
+                        const aspectRatio = width / (img.height || parseInt(computedStyle.height) || width);
                         const newWidth = maxWidth;
                         const newHeight = newWidth / aspectRatio;
                         
                         // Apply new dimensions
                         img.style.width = newWidth + 'px';
                         img.style.height = newHeight + 'px';
-                    }
-                });
-                
-                // Identify and mark potential persistent headers
-                // We'll look for elements that are likely to be headers
-                const potentialHeaders = document.querySelectorAll('header, nav, .header, #header, [class*="header"], [class*="nav"], [id*="nav"], [class*="menu"], [id*="menu"]');
-                
-                potentialHeaders.forEach(header => {
-                    if (header.getBoundingClientRect().top < 100) {
-                        // Mark header elements with a data attribute
-                        header.dataset.persistentHeader = 'true';
+                        img.style.maxWidth = '100%';
                     }
                 });
             }""")
             
-            # Ensure images are loaded
-            print("Waiting for images to load...")
-            await page.wait_for_load_state('networkidle')
-            
-            # Additional wait for any lazy-loaded images
-            await page.evaluate("""() => {
-                return new Promise((resolve) => {
-                    const images = document.querySelectorAll('img');
-                    let loaded = 0;
+            # Apply similar image resizing to rest_pages
+            await rest_pages.evaluate("""() => {
+                // Resize large images
+                const viewportWidth = window.innerWidth;
+                const maxWidth = viewportWidth * 0.33; // 33% of viewport width
+                
+                document.querySelectorAll('img').forEach(img => {
+                    const computedStyle = window.getComputedStyle(img);
+                    let width = img.width || parseInt(computedStyle.width);
                     
-                    if (images.length === 0) {
-                        resolve();
-                        return;
+                    if (width > maxWidth) {
+                        // Save original dimensions
+                        img.dataset.originalWidth = width;
+                        img.dataset.originalHeight = img.height || parseInt(computedStyle.height);
+                        
+                        // Calculate new dimensions maintaining aspect ratio
+                        const aspectRatio = width / (img.height || parseInt(computedStyle.height) || width);
+                        const newWidth = maxWidth;
+                        const newHeight = newWidth / aspectRatio;
+                        
+                        // Apply new dimensions
+                        img.style.width = newWidth + 'px';
+                        img.style.height = newHeight + 'px';
+                        img.style.maxWidth = '100%';
                     }
-                    
-                    images.forEach(img => {
-                        if (img.complete) {
-                            loaded++;
-                            if (loaded === images.length) resolve();
-                        } else {
-                            img.addEventListener('load', () => {
-                                loaded++;
-                                if (loaded === images.length) resolve();
-                            });
-                            img.addEventListener('error', () => {
-                                loaded++;
-                                if (loaded === images.length) resolve();
-                            });
+                });
+            }""")
+            
+            # Identify and preserve headers on first page only
+            await first_page.evaluate("""() => {
+                // Find potential header elements
+                const potentialHeaders = [
+                    'header', '.header', '#header',
+                    'nav', '.nav', '#nav',
+                    '.navbar', '#navbar',
+                    '.site-header', '#site-header',
+                    '.page-header', '#page-header',
+                    '.main-header', '#main-header'
+                ];
+                
+                // Mark headers for keeping
+                potentialHeaders.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top < 100) {
+                            el.dataset.header = 'preserve';
                         }
                     });
                 });
             }""")
             
-            # Create a modified CSS to hide persistent headers on print
-            await page.add_style_tag(content="""
-                @media print {
-                    [data-persistent-header="true"] {
-                        display: none !important;
-                    }
-                    
-                    /* Make sure the first page still shows the header */
-                    @page:first {
-                        [data-persistent-header="true"] {
-                            display: block !important;
+            # Hide headers on rest_pages
+            await rest_pages.evaluate("""() => {
+                // Find potential header elements
+                const potentialHeaders = [
+                    'header', '.header', '#header',
+                    'nav', '.nav', '#nav',
+                    '.navbar', '#navbar',
+                    '.site-header', '#site-header',
+                    '.page-header', '#page-header',
+                    '.main-header', '#main-header'
+                ];
+                
+                // Hide headers
+                potentialHeaders.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top < 100) {
+                            el.style.display = 'none';
                         }
-                    }
-                }
-            """)
+                    });
+                });
+            }""")
             
-            # Save the page as PDF with margins
-            print("Generating PDF...")
-            await page.pdf(
-                path=output_path,
+            # Generate PDFs from both pages
+            print("Generating first page PDF...")
+            await first_page.pdf(
+                path=first_page_pdf,
                 format='Letter',
                 margin={
                     'top': '0.75in',
@@ -184,12 +295,68 @@ async def capture_webpage(url, output_path, viewport_width=1280, viewport_height
                     'bottom': '0.75in',
                     'left': '0.75in'
                 },
+                scale=scale/100,
+                print_background=True
+            )
+            
+            print("Generating remaining pages PDF...")
+            await rest_pages.pdf(
+                path=rest_pages_pdf,
+                format='Letter',
+                margin={
+                    'top': '0.75in',
+                    'right': '0.75in',
+                    'bottom': '0.75in',
+                    'left': '0.75in'
+                },
+                scale=scale/100,
                 print_background=True
             )
             
         finally:
             await browser.close()
-            
+    
+    # Merge the PDFs
+    print("Merging PDFs...")
+    merged_pdf = merge_pdfs(first_page_pdf, rest_pages_pdf, output_path)
+    
+    # Clean up temporary files
+    if os.path.exists(first_page_pdf):
+        os.remove(first_page_pdf)
+    if os.path.exists(rest_pages_pdf):
+        os.remove(rest_pages_pdf)
+    
+    return merged_pdf
+
+
+def merge_pdfs(first_page_pdf, rest_pages_pdf, output_path):
+    """
+    Merge the first page PDF with the rest of the pages PDF.
+    
+    Args:
+        first_page_pdf: Path to the PDF containing only the first page
+        rest_pages_pdf: Path to the PDF containing the rest of the pages
+        output_path: Path where the merged PDF will be saved
+    """
+    writer = PdfWriter()
+    
+    # Add the first page from first_page_pdf
+    if os.path.exists(first_page_pdf):
+        first_reader = PdfReader(first_page_pdf)
+        if len(first_reader.pages) > 0:
+            writer.add_page(first_reader.pages[0])
+    
+    # Add the rest of the pages from rest_pages_pdf (skip the first page)
+    if os.path.exists(rest_pages_pdf):
+        rest_reader = PdfReader(rest_pages_pdf)
+        # Skip the first page of rest_pages as it would be duplicate
+        for page_num in range(1, len(rest_reader.pages)):
+            writer.add_page(rest_reader.pages[page_num])
+    
+    # Write the merged PDF
+    with open(output_path, "wb") as f:
+        writer.write(f)
+    
     return output_path
 
 
@@ -254,8 +421,13 @@ def add_header_footer(input_pdf, output_pdf, url, timestamp):
 @click.option('--output', '-o', default=None, help='Output PDF file path')
 @click.option('--width', '-w', default=1280, help='Viewport width in pixels')
 @click.option('--height', '-h', default=800, help='Viewport height in pixels')
-def main(url, output, width, height):
+@click.option('--scale', '-s', default=100, help='Percentage scale for the content (100 = full size)')
+def main(url, output, width, height, scale):
     """Convert a web page to PDF with high fidelity."""
+    # Validate scale value
+    if not (10 <= scale <= 200):
+        raise click.BadParameter("Scale must be between 10 and 200")
+    
     # Generate default output filename if not provided
     if not output:
         domain = urlparse(url).netloc
@@ -271,7 +443,7 @@ def main(url, output, width, height):
     try:
         # Convert webpage to PDF
         print(f"Capturing webpage: {url}")
-        asyncio.run(capture_webpage(url, temp_pdf, width, height))
+        asyncio.run(capture_webpage(url, temp_pdf, width, height, scale))
         
         # Add header and footer to the PDF
         print("Adding headers, footers, and page numbers...")
